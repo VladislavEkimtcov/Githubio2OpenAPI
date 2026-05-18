@@ -39,6 +39,12 @@ Usage Example
    tab = browser.open_tab("https://example.com")
 """
 
+SAMPLE_BROKEN = """Broken API
+==========
+
+.. autoclass:: samplepkg.api.MissingBrowser
+"""
+
 SAMPLE_QUICKSTART = """Quickstart Guide
 ================
 
@@ -75,7 +81,7 @@ class Element:
 
 
 class Tab:
-    """Represents a browser tab."""
+    """Represents a :class:`Browser` tab."""
 
     def __init__(self, url: str) -> None:
         self.url = url
@@ -86,7 +92,7 @@ class Tab:
 
 
 class Browser:
-    """High-level browser controller."""
+    """High-level :class:`Browser` controller."""
 
     def __init__(self, headless: bool = True) -> None:
         self.headless = headless
@@ -94,7 +100,7 @@ class Browser:
 
     @classmethod
     def create(cls, headless: bool = True) -> "Browser":
-        """Create a browser instance."""
+        """Create a :class:`Browser` instance."""
         return cls(headless=headless)
 
     def open_tab(self, url: str) -> Tab:
@@ -114,7 +120,7 @@ class Browser:
 
 
 def connect(endpoint: str) -> Browser:
-    """Connect to a remote browser endpoint."""
+    """Connect to a remote :class:`Browser` endpoint."""
     return Browser.create(headless=False)
 '''
 
@@ -136,6 +142,7 @@ def build_docs_tree(tmp_path: Path) -> Path:
     docs_dir.mkdir()
     (docs_dir / "index.rst").write_text(SAMPLE_INDEX, encoding="utf-8")
     (docs_dir / "api.rst").write_text(SAMPLE_API, encoding="utf-8")
+    (docs_dir / "broken.rst").write_text(SAMPLE_BROKEN, encoding="utf-8")
     nested_dir = docs_dir / "guides"
     nested_dir.mkdir()
     (nested_dir / "quickstart.rst").write_text(SAMPLE_QUICKSTART, encoding="utf-8")
@@ -148,7 +155,7 @@ def test_get_all_doc_files_only_returns_rst_files(tmp_path: Path) -> None:
 
     doc_map = get_all_doc_files(docs_dir)
 
-    assert sorted(doc_map) == ["api.rst", "guides/quickstart.rst", "index.rst"]
+    assert sorted(doc_map) == ["api.rst", "broken.rst", "guides/quickstart.rst", "index.rst"]
 
 
 def test_toc_lists_available_documents(tmp_path: Path) -> None:
@@ -158,7 +165,7 @@ def test_toc_lists_available_documents(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert [item["path"] for item in payload] == ["api.rst", "guides/quickstart.rst", "index.rst"]
+    assert [item["path"] for item in payload] == ["api.rst", "broken.rst", "guides/quickstart.rst", "index.rst"]
     assert payload[0]["title"] == "API Reference"
     assert payload[0]["symbols"] >= 4
     assert payload[0]["anchors"] >= 2
@@ -211,6 +218,21 @@ def test_view_document_supports_rendered_and_structured_autodoc_formats(tmp_path
     assert structured_payload["metadata"]["project_version"] == "1.2.3"
 
 
+def test_import_failure_snippets_are_clean_and_human_readable(tmp_path: Path) -> None:
+    client = TestClient(build_app(build_docs_tree(tmp_path)))
+
+    response = client.get(
+        "/docs/view",
+        params={"file_path": "broken.rst", "content_format": "rendered"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "Autodoc import failed: Attribute 'MissingBrowser' not found while resolving 'samplepkg.api.MissingBrowser'." in payload["content"]
+    assert "<module" not in payload["content"]
+    assert "object at 0x" not in payload["content"]
+
+
 def test_view_document_returns_not_found_for_unknown_path(tmp_path: Path) -> None:
     client = TestClient(build_app(build_docs_tree(tmp_path)))
 
@@ -245,6 +267,18 @@ def test_search_supports_exact_symbol_lookup_and_path_prefix_filtering(tmp_path:
     assert filtered_payload
     assert all(item["path"].startswith("guides/") for item in filtered_payload)
     assert filtered_payload[0]["exact_symbol_match"] is False
+
+    short_name_response = client.get(
+        "/docs/search",
+        params={"query": "Tab", "exact_symbol": True},
+    )
+
+    assert short_name_response.status_code == 200
+    short_payload = short_name_response.json()
+    assert short_payload
+    assert short_payload[0]["matched_symbols"] == ["samplepkg.api.Tab"]
+    assert short_payload[0]["anchor"].endswith("tab")
+    assert short_payload[0]["line_start"] <= short_payload[0]["line_end"]
 
 
 def test_search_results_include_anchor_line_ranges_and_code_blocks(tmp_path: Path) -> None:
@@ -284,6 +318,24 @@ def test_metadata_and_members_endpoint_expose_normalized_api(tmp_path: Path) -> 
     assert "_hidden" not in names
     open_tab = next(member for member in members_payload["members"] if member["name"] == "open_tab")
     assert "url" in open_tab["signature"]
+    assert "'" not in open_tab["signature"]
+    assert open_tab["anchor"].endswith("open-tab")
+    assert open_tab["line_start"] <= open_tab["line_end"]
+    assert ":class:" not in members_payload["owner_summary"]
+
+    tab_members_response = client.get("/docs/members", params={"symbol": "Tab"})
+
+    assert tab_members_response.status_code == 200
+    tab_payload = tab_members_response.json()
+    assert tab_payload["resolved_symbol"] == "samplepkg.api.Tab"
+    assert tab_payload["owner_kind"] == "class"
+    assert tab_payload["path"] == "api.rst"
+    assert tab_payload["anchor"].endswith("tab")
+    assert tab_payload["line_start"] <= tab_payload["line_end"]
+    assert ":class:" not in tab_payload["owner_summary"]
+    find_member = next(member for member in tab_payload["members"] if member["name"] == "find")
+    assert "selector: str" in find_member["signature"]
+    assert "'" not in find_member["signature"]
 
 
 def test_openapi_and_swagger_ui_are_available(tmp_path: Path) -> None:
@@ -308,6 +360,6 @@ def test_openapi_and_swagger_ui_are_available(tmp_path: Path) -> None:
 
     assert health_response.status_code == 200
     health_payload = health_response.json()
-    assert health_payload["indexed_files"] == 3
+    assert health_payload["indexed_files"] == 4
     assert health_payload["metadata"]["project_version"] == "1.2.3"
 

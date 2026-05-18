@@ -73,6 +73,8 @@ Query parameters:
 
 Search results include anchors, line ranges, matched symbols, and nearby extracted code blocks.
 
+Exact-symbol queries also resolve documented short names such as `Browser`, `Tab`, or `Element` when they are unambiguous in the indexed docs.
+
 ### `GET /docs/metadata`
 
 Returns best-effort project metadata such as project version, installed package version, source commit, and Python compatibility.
@@ -84,6 +86,8 @@ Query parameters:
 - `symbol` – class or module symbol to inspect, for example `nodriver.Browser`
 
 Returns normalized members with stable kinds, signatures, summaries, anchors, and line ranges so external tooling can avoid runtime introspection fallback.
+
+Short-name lookups such as `Browser` and `Tab` are supported when those symbols can be resolved from the rendered documentation corpus.
 
 ## Test
 

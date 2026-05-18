@@ -41,6 +41,7 @@ SIMPLE_LINK_RE = re.compile(r"`([^`]+)`_")
 DOUBLE_BACKTICK_RE = re.compile(r"``([^`]+)``")
 STRONG_RE = re.compile(r"\*\*([^*]+)\*\*")
 EMPHASIS_RE = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
+QUOTED_ANNOTATION_RE = re.compile(r"(:\s*|->\s*)(['\"])([^'\"]+)\2")
 
 
 class ContentFormat(str, Enum):
@@ -154,6 +155,8 @@ class MembersResponse(BaseModel):
 	owner_summary: str | None = None
 	path: str | None = None
 	anchor: str | None = None
+	line_start: int | None = None
+	line_end: int | None = None
 	members: List[NormalizedMember] = Field(default_factory=list)
 	metadata: ProjectMetadata | None = None
 
@@ -247,6 +250,20 @@ def clean_inline_markup(line: str) -> str:
 	return cleaned
 
 
+def sanitize_extracted_text(text: str | None, *, preserve_newlines: bool = False) -> str | None:
+	if text is None:
+		return None
+
+	cleaned = clean_inline_markup(text.replace("\r\n", "\n"))
+	if preserve_newlines:
+		cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+		cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+	else:
+		cleaned = re.sub(r"\s*\n\s*", " ", cleaned)
+	cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+	return cleaned.strip() or None
+
+
 def extract_title(content: str, fallback: str) -> str:
 	text = extract_rst_text(content)
 	for line in text.splitlines():
@@ -260,7 +277,7 @@ def first_nonempty_line(text: str | None) -> str | None:
 	if not text:
 		return None
 	for line in text.splitlines():
-		candidate = line.strip()
+		candidate = sanitize_extracted_text(line)
 		if candidate:
 			return candidate[:300]
 	return None
@@ -272,15 +289,21 @@ def slugify(value: str) -> str:
 
 
 def safe_signature(obj: Any) -> str | None:
-	try:
-		return str(inspect.signature(obj))
-	except (TypeError, ValueError):
-		return None
+	for eval_str in (True, False):
+		try:
+			signature = str(inspect.signature(obj, eval_str=eval_str))
+		except (NameError, TypeError, ValueError):
+			continue
+		cleaned = sanitize_extracted_text(signature)
+		if cleaned:
+			cleaned = QUOTED_ANNOTATION_RE.sub(r"\1\3", cleaned)
+		return cleaned
+	return None
 
 
 def safe_doc_summary(obj: Any) -> str | None:
 	try:
-		return first_nonempty_line(inspect.getdoc(obj))
+		return sanitize_extracted_text(first_nonempty_line(inspect.getdoc(obj)))
 	except Exception:
 		return None
 
@@ -312,6 +335,12 @@ def build_symbol_keys(symbol: str) -> list[str]:
 	for index in range(len(parts)):
 		keys.append(".".join(parts[index:]).lower())
 	return keys or [symbol.lower()]
+
+
+def format_import_error(target: str, *, missing_attribute: str | None = None) -> str:
+	if missing_attribute:
+		return f"Attribute '{sanitize_extracted_text(missing_attribute) or missing_attribute}' not found while resolving '{target}'."
+	return f"Unable to resolve '{target}' as an importable symbol."
 
 
 def parse_option_members(value: str | bool | None) -> set[str] | None:
@@ -465,19 +494,22 @@ def resolve_import_target(target: str, search_roots: Iterable[Path]) -> tuple[An
 				continue
 
 			current: Any = module
-			try:
-				for attr in parts[index:]:
+			for attr in parts[index:]:
+				try:
 					current = getattr(current, attr)
-			except AttributeError as exc:
-				return None, str(exc)
+				except AttributeError:
+					return None, format_import_error(target, missing_attribute=attr)
 			return current, None
-	return None, f"Unable to import autodoc target '{target}'."
+	return None, format_import_error(target)
 
 
 def wrap_summary(summary: str | None) -> list[str]:
 	if not summary:
 		return []
-	return textwrap.wrap(summary, width=100) or [summary]
+	cleaned = sanitize_extracted_text(summary)
+	if not cleaned:
+		return []
+	return textwrap.wrap(cleaned, width=100) or [cleaned]
 
 
 def build_owner_member(target: str, obj: Any) -> NormalizedMember:
@@ -508,21 +540,22 @@ def build_member_line(member: NormalizedMember) -> str:
 def build_autodoc_entry(target: str, directive: str, options: dict[str, str | bool], search_roots: Iterable[Path]) -> tuple[AutodocEntry, NormalizedMember, list[NormalizedMember], list[str]]:
 	resolved, error = resolve_import_target(target, search_roots)
 	if resolved is None:
+		failure = sanitize_extracted_text(error) or format_import_error(target)
 		entry = AutodocEntry(
 			target=target,
 			kind=directive.removeprefix("auto"),
 			title=normalize_member_name(target),
 			anchor=slugify(target),
-			summary=error,
+			summary=failure,
 		)
 		owner_member = NormalizedMember(
 			name=normalize_member_name(target),
 			qualname=target,
 			kind=entry.kind,
-			summary=error,
+			summary=failure,
 			anchor=entry.anchor,
 		)
-		lines = [f"{entry.title} [{entry.kind}]", f"Target: {target}", f"Autodoc import failed: {error}"]
+		lines = [f"{entry.title} [{entry.kind}]", f"Target: {target}", f"Autodoc import failed: {failure}"]
 		return entry, owner_member, [], lines
 
 	owner_member = build_owner_member(target, resolved)
@@ -545,7 +578,7 @@ def build_autodoc_entry(target: str, directive: str, options: dict[str, str | bo
 	entry.members = members
 	lines = [f"{entry.title} [{entry.kind}]", f"Target: {target}"]
 	if entry.signature:
-		lines.append(f"Signature: {entry.title}{entry.signature}")
+		lines.append(f"Signature: {entry.title}{sanitize_extracted_text(entry.signature) or entry.signature}")
 	lines.extend(wrap_summary(entry.summary))
 	if entry.members:
 		lines.append("Members:")
@@ -636,6 +669,25 @@ def finalize_anchor_ranges(anchors: list[DocAnchor], total_lines: int) -> None:
 	for index, anchor in enumerate(anchors):
 		next_start = anchors[index + 1].line_start if index + 1 < len(anchors) else total_lines + 1
 		anchor.line_end = max(anchor.line_start, next_start - 1)
+
+
+def apply_anchor_ranges_to_members(
+	*,
+	anchors: list[DocAnchor],
+	entries: list[AutodocEntry],
+	symbols: list[NormalizedMember],
+) -> None:
+	anchor_map = {anchor.anchor: anchor for anchor in anchors}
+	for entry in entries:
+		if entry.anchor in anchor_map:
+			anchor = anchor_map[entry.anchor]
+			entry.line_start = anchor.line_start
+			entry.line_end = anchor.line_end
+	for symbol in symbols:
+		if symbol.anchor and symbol.anchor in anchor_map:
+			anchor = anchor_map[symbol.anchor]
+			symbol.line_start = anchor.line_start
+			symbol.line_end = anchor.line_end
 
 
 def build_line_snippet(lines: list[str], center_line: int, radius: int = 2) -> tuple[str, int, int]:
@@ -801,6 +853,7 @@ def build_document_record(
 
 	total_lines = len(rendered_lines)
 	finalize_anchor_ranges(anchors, total_lines)
+	apply_anchor_ranges_to_members(anchors=anchors, entries=entries, symbols=symbols)
 	rendered_content = "\n".join(rendered_lines).strip()
 	text_content = extract_rst_text(rendered_content)
 	structured = StructuredDocument(entries=entries, symbols=symbols)
@@ -850,6 +903,63 @@ class DocumentationLibrary:
 						self.symbol_index.setdefault(key, []).append(location)
 					self.symbol_index.setdefault(symbol.name.lower(), []).append(location)
 
+	def _candidate_locations(self, query: str, *, owner_only: bool = False) -> list[SymbolLocation]:
+		query = query.strip()
+		if not query:
+			return []
+
+		query_lower = query.lower()
+		seen: set[tuple[str, str, str | None]] = set()
+		candidates: list[SymbolLocation] = []
+		for key in [query_lower, *build_symbol_keys(query)]:
+			for location in self.symbol_index.get(key, []):
+				candidate_key = (location.record.path, location.member.qualname, location.member.anchor)
+				if candidate_key in seen:
+					continue
+				seen.add(candidate_key)
+				candidates.append(location)
+
+		if owner_only:
+			candidates = [candidate for candidate in candidates if candidate.member.kind in {"class", "module"}]
+
+		def priority(location: SymbolLocation) -> tuple[int, int, int, int, str, str]:
+			qualname = location.member.qualname.lower()
+			name = location.member.name.lower()
+			if qualname == query_lower:
+				match_rank = 0
+			elif name == query_lower:
+				match_rank = 1
+			elif query_lower in build_symbol_keys(location.member.qualname):
+				match_rank = 2
+			else:
+				match_rank = 3
+			owner_rank = 0 if location.member.kind in {"class", "module"} else 1
+			dedicated_entry_rank = 0 if location.entry and location.entry.target.lower() == qualname else 1
+			anchor_rank = 0 if location.member.anchor else 1
+			return (match_rank, owner_rank, dedicated_entry_rank, anchor_rank, location.record.path, location.member.qualname)
+
+		candidates.sort(key=priority)
+		return candidates
+
+	def _best_documented_location(self, query: str, *, owner_only: bool = False) -> SymbolLocation | None:
+		locations = self._candidate_locations(query, owner_only=owner_only)
+		return locations[0] if locations else None
+
+	def _apply_documented_member_metadata(self, members: list[NormalizedMember]) -> list[NormalizedMember]:
+		enriched: list[NormalizedMember] = []
+		for member in members:
+			copy = member.model_copy(deep=True)
+			location = self._best_documented_location(copy.qualname)
+			if location and location.member.qualname.lower() == copy.qualname.lower():
+				if location.member.anchor:
+					copy.anchor = location.member.anchor
+				copy.line_start = location.member.line_start
+				copy.line_end = location.member.line_end
+				copy.summary = location.member.summary or copy.summary
+				copy.signature = location.member.signature or copy.signature
+			enriched.append(copy)
+		return enriched
+
 	def toc(self) -> List[DocFile]:
 		return [
 			DocFile(
@@ -866,6 +976,12 @@ class DocumentationLibrary:
 		return self.records.get(file_path)
 
 	def find_member_owner(self, query: str) -> tuple[DocumentRecord | None, AutodocEntry | None, list[NormalizedMember]]:
+		location = self._best_documented_location(query, owner_only=True)
+		if location is not None:
+			if location.entry and location.entry.target.lower() == location.member.qualname.lower():
+				return location.record, location.entry, location.entry.members
+			return location.record, None, []
+
 		query_lower = query.strip().lower()
 		for locations in [self.symbol_index.get(query_lower, [])]:
 			for location in locations:
@@ -881,6 +997,36 @@ class DocumentationLibrary:
 		return None, None, []
 
 	def members_for_symbol(self, query: str) -> MembersResponse:
+		owner_location = self._best_documented_location(query, owner_only=True)
+		if owner_location is not None:
+			if owner_location.entry and owner_location.entry.target.lower() == owner_location.member.qualname.lower():
+				members = [member.model_copy(deep=True) for member in owner_location.entry.members]
+			else:
+				resolved, error = resolve_import_target(owner_location.member.qualname, self.search_roots)
+				if resolved is None:
+					raise HTTPException(status_code=404, detail=error or f"Symbol '{query}' not found.")
+				if inspect.isclass(resolved):
+					members = collect_class_members(resolved, {"members": True, "undoc-members": True})
+				elif inspect.ismodule(resolved):
+					members = collect_module_members(resolved, {"members": True, "undoc-members": True})
+				else:
+					members = []
+				members = self._apply_documented_member_metadata(members)
+
+			return MembersResponse(
+				query=query,
+				resolved_symbol=owner_location.member.qualname,
+				owner_kind=owner_location.member.kind,
+				owner_signature=owner_location.member.signature,
+				owner_summary=owner_location.member.summary,
+				path=owner_location.record.path,
+				anchor=owner_location.member.anchor,
+				line_start=owner_location.member.line_start,
+				line_end=owner_location.member.line_end,
+				members=members,
+				metadata=self.metadata,
+			)
+
 		record, entry, members = self.find_member_owner(query)
 		if entry is not None:
 			return MembersResponse(
@@ -891,6 +1037,8 @@ class DocumentationLibrary:
 				owner_summary=entry.summary,
 				path=record.path if record else None,
 				anchor=entry.anchor,
+				line_start=entry.line_start,
+				line_end=entry.line_end,
 				members=members,
 				metadata=self.metadata,
 			)
@@ -905,13 +1053,16 @@ class DocumentationLibrary:
 			members = collect_module_members(resolved, {"members": True, "undoc-members": True})
 		else:
 			members = []
+		members = self._apply_documented_member_metadata(members)
 		return MembersResponse(
 			query=query,
-			resolved_symbol=query,
+			resolved_symbol=owner_member.qualname,
 			owner_kind=owner_member.kind,
 			owner_signature=owner_member.signature,
 			owner_summary=owner_member.summary,
 			anchor=owner_member.anchor,
+			line_start=owner_member.line_start,
+			line_end=owner_member.line_end,
 			members=members,
 			metadata=self.metadata,
 		)
@@ -982,7 +1133,7 @@ class DocumentationLibrary:
 		if exact_symbol:
 			results: list[SearchResult] = []
 			seen: set[tuple[str, str | None]] = set()
-			for location in self.symbol_index.get(query.lower(), []):
+			for location in self._candidate_locations(query):
 				if not self._record_matches_path_prefix(location.record, path_prefix):
 					continue
 				key = (location.record.path, location.member.anchor)
@@ -990,7 +1141,7 @@ class DocumentationLibrary:
 					continue
 				seen.add(key)
 				line_number = location.member.line_start or (location.entry.line_start if location.entry else 1) or 1
-				snippet, line_start, line_end = build_line_snippet(location.record.rendered_lines, line_number, radius=1)
+				snippet, snippet_start, snippet_end = build_line_snippet(location.record.rendered_lines, line_number, radius=1)
 				results.append(
 					SearchResult(
 						path=location.record.path,
@@ -998,8 +1149,8 @@ class DocumentationLibrary:
 						snippet=snippet,
 						matches=1,
 						anchor=location.member.anchor or (location.entry.anchor if location.entry else None),
-						line_start=line_start,
-						line_end=line_end,
+						line_start=location.member.line_start or snippet_start,
+						line_end=location.member.line_end or snippet_end,
 						code_blocks=self._nearby_code_blocks(location.record, line_number),
 						matched_symbols=[location.member.qualname],
 						exact_symbol_match=True,
