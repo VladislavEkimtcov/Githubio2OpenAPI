@@ -27,6 +27,10 @@ SAMPLE_API = """API Reference
    :undoc-members:
    :exclude-members: _hidden
 
+.. autoclass:: samplepkg.api.Element
+   :members:
+   :undoc-members:
+
 .. automodule:: samplepkg.api
    :members: connect, Tab, Element
 
@@ -78,6 +82,11 @@ class Element:
 
     def __init__(self, selector: str) -> None:
         self.selector = selector
+
+    @property
+    def tab(self) -> str:
+        """'"""
+        return self.selector
 
 
 class Tab:
@@ -279,6 +288,22 @@ def test_search_supports_exact_symbol_lookup_and_path_prefix_filtering(tmp_path:
     assert short_payload[0]["matched_symbols"] == ["samplepkg.api.Tab"]
     assert short_payload[0]["anchor"].endswith("tab")
     assert short_payload[0]["line_start"] <= short_payload[0]["line_end"]
+    assert all(result["matched_symbols"] != ["samplepkg.api.Element.tab"] for result in short_payload[:1])
+
+
+def test_search_demotes_autodoc_import_failure_noise(tmp_path: Path) -> None:
+    client = TestClient(build_app(build_docs_tree(tmp_path)))
+
+    response = client.get("/docs/search", params={"query": "Browser"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload
+    assert payload[0]["path"] == "api.rst"
+    assert "Autodoc import failed" not in payload[0]["snippet"]
+    if any(item["path"] == "broken.rst" for item in payload):
+        broken_index = next(index for index, item in enumerate(payload) if item["path"] == "broken.rst")
+        assert broken_index > 0
 
 
 def test_search_results_include_anchor_line_ranges_and_code_blocks(tmp_path: Path) -> None:
@@ -336,6 +361,15 @@ def test_metadata_and_members_endpoint_expose_normalized_api(tmp_path: Path) -> 
     find_member = next(member for member in tab_payload["members"] if member["name"] == "find")
     assert "selector: str" in find_member["signature"]
     assert "'" not in find_member["signature"]
+
+    element_members_response = client.get("/docs/members", params={"symbol": "Element"})
+
+    assert element_members_response.status_code == 200
+    element_payload = element_members_response.json()
+    tab_property = next(member for member in element_payload["members"] if member["name"] == "tab")
+    assert tab_property["summary"] is None
+    assert tab_property["anchor"].endswith("tab")
+    assert tab_property["line_start"] <= tab_property["line_end"]
 
 
 def test_openapi_and_swagger_ui_are_available(tmp_path: Path) -> None:

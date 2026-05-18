@@ -73,7 +73,9 @@ Query parameters:
 
 Search results include anchors, line ranges, matched symbols, and nearby extracted code blocks.
 
-Exact-symbol queries also resolve documented short names such as `Browser`, `Tab`, or `Element` when they are unambiguous in the indexed docs.
+Exact-symbol queries also resolve documented short names such as `Browser`, `Tab`, or `Element` when they are unambiguous in the indexed docs, and they prefer the documented class/module symbol over lowercase member collisions such as `Element.tab`.
+
+Generic search also demotes noisy autodoc import-failure text so broken-reference pages rank below real API content when both match the same symbol.
 
 ### `GET /docs/metadata`
 

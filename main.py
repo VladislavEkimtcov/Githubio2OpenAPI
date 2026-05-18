@@ -261,7 +261,30 @@ def sanitize_extracted_text(text: str | None, *, preserve_newlines: bool = False
 	else:
 		cleaned = re.sub(r"\s*\n\s*", " ", cleaned)
 	cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-	return cleaned.strip() or None
+	cleaned = cleaned.strip()
+	if not cleaned:
+		return None
+	if re.fullmatch(r"['\"`]+", cleaned):
+		return None
+	if not re.search(r"[A-Za-z0-9]", cleaned) and re.search(r"['\"`.,:;!?()\[\]{}\-_/\\]+", cleaned):
+		return None
+	return cleaned
+
+
+def is_import_failure_text(text: str | None) -> bool:
+	if not text:
+		return False
+	normalized = sanitize_extracted_text(text) or ""
+	return normalized.startswith("Autodoc import failed:") or normalized.startswith("Unable to resolve '") or "not found while resolving" in normalized
+
+
+def is_noise_summary(text: str | None) -> bool:
+	if not text:
+		return True
+	normalized = sanitize_extracted_text(text)
+	if not normalized:
+		return True
+	return is_import_failure_text(normalized)
 
 
 def extract_title(content: str, fallback: str) -> str:
@@ -303,7 +326,8 @@ def safe_signature(obj: Any) -> str | None:
 
 def safe_doc_summary(obj: Any) -> str | None:
 	try:
-		return sanitize_extracted_text(first_nonempty_line(inspect.getdoc(obj)))
+		summary = sanitize_extracted_text(first_nonempty_line(inspect.getdoc(obj)))
+		return None if is_noise_summary(summary) else summary
 	except Exception:
 		return None
 
@@ -507,7 +531,7 @@ def wrap_summary(summary: str | None) -> list[str]:
 	if not summary:
 		return []
 	cleaned = sanitize_extracted_text(summary)
-	if not cleaned:
+	if not cleaned or is_noise_summary(cleaned):
 		return []
 	return textwrap.wrap(cleaned, width=100) or [cleaned]
 
@@ -925,6 +949,7 @@ class DocumentationLibrary:
 		def priority(location: SymbolLocation) -> tuple[int, int, int, int, str, str]:
 			qualname = location.member.qualname.lower()
 			name = location.member.name.lower()
+			is_short_query = "." not in query_lower
 			if qualname == query_lower:
 				match_rank = 0
 			elif name == query_lower:
@@ -934,9 +959,18 @@ class DocumentationLibrary:
 			else:
 				match_rank = 3
 			owner_rank = 0 if location.member.kind in {"class", "module"} else 1
+			short_name_owner_rank = 0 if is_short_query and name == query_lower and location.member.kind in {"class", "module"} else 1
 			dedicated_entry_rank = 0 if location.entry and location.entry.target.lower() == qualname else 1
 			anchor_rank = 0 if location.member.anchor else 1
-			return (match_rank, owner_rank, dedicated_entry_rank, anchor_rank, location.record.path, location.member.qualname)
+			return (
+				match_rank,
+				short_name_owner_rank,
+				owner_rank,
+				dedicated_entry_rank,
+				anchor_rank,
+				location.record.path,
+				location.member.qualname,
+			)
 
 		candidates.sort(key=priority)
 		return candidates
@@ -1091,17 +1125,26 @@ class DocumentationLibrary:
 		if not matching_lines:
 			return None
 
-		best_line = matching_lines[0]
+		non_failure_matching_lines = [line_number for line_number in matching_lines if not is_import_failure_text(lines[line_number - 1])]
+		best_line = non_failure_matching_lines[0] if non_failure_matching_lines else matching_lines[0]
 		matched_symbols = [
 			symbol.qualname
 			for symbol in record.structured.symbols
 			if query_lower in symbol.qualname.lower() or (symbol.signature and query_lower in symbol.signature.lower())
 		]
+		matched_symbols = [symbol for symbol in matched_symbols if symbol]
 		snippet, line_start, line_end = build_line_snippet(lines, best_line)
 		anchor = find_anchor_for_line(record.anchors, best_line)
 		phrase_matches = record.rendered_content.lower().count(query_lower)
 		term_matches = sum(record.rendered_content.lower().count(term) for term in terms)
-		score = phrase_matches * 10 + term_matches + len(matched_symbols) * 4
+		failure_penalty = 0
+		if any(is_import_failure_text(lines[line_number - 1]) for line_number in matching_lines):
+			failure_penalty += 12
+		if is_import_failure_text(snippet):
+			failure_penalty += 8
+		if any(is_import_failure_text(symbol.summary) for symbol in record.structured.symbols):
+			failure_penalty += 6
+		score = phrase_matches * 10 + term_matches + len(matched_symbols) * 4 - failure_penalty
 		return (
 			score,
 			SearchResult(
@@ -1156,7 +1199,6 @@ class DocumentationLibrary:
 						exact_symbol_match=True,
 					)
 				)
-			results.sort(key=lambda item: (item.path, item.anchor or ""))
 			return results[:limit]
 
 		terms = [term for term in re.split(r"\s+", query.lower()) if term]
